@@ -182,17 +182,32 @@ impl NostrClientTransport {
         pending: Arc<RwLock<HashSet<String>>>,
         server_pubkey: PublicKey,
         tx: tokio::sync::mpsc::UnboundedSender<JsonRpcMessage>,
-        _encryption_mode: EncryptionMode,
+        encryption_mode: EncryptionMode,
     ) {
         let mut notifications = client.notifications();
 
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
+                let is_gift_wrap = is_gift_wrap_kind(&event.kind);
+
+                // Early policy enforcement: save CPU by validating before decryption
+                if is_gift_wrap && encryption_mode == EncryptionMode::Disabled {
+                    tracing::warn!(
+                        event_id = %event.id.to_hex(),
+                        "Received encrypted response but encryption is disabled"
+                    );
+                    continue;
+                }
+                if !is_gift_wrap && encryption_mode == EncryptionMode::Required {
+                    tracing::warn!(
+                        event_id = %event.id.to_hex(),
+                        "Received unencrypted response but encryption is required"
+                    );
+                    continue;
+                }
+
                 // Handle gift-wrapped events
-                let (actual_event_content, actual_pubkey, e_tag) = if event.kind
-                    == Kind::Custom(GIFT_WRAP_KIND)
-                    || event.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
-                {
+                let (actual_event_content, actual_pubkey, e_tag) = if is_gift_wrap {
                     // Single-layer NIP-44 decrypt (matches JS/TS SDK)
                     let signer = match client.signer().await {
                         Ok(s) => s,
@@ -256,6 +271,11 @@ impl NostrClientTransport {
             }
         }
     }
+}
+
+#[inline]
+fn is_gift_wrap_kind(kind: &Kind) -> bool {
+    *kind == Kind::Custom(GIFT_WRAP_KIND) || *kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
 }
 
 #[cfg(test)]
@@ -331,5 +351,12 @@ mod tests {
             params: None,
         });
         assert_eq!(init_notif.method(), Some("notifications/initialized"));
+    }
+
+    #[test]
+    fn test_gift_wrap_kind_detection() {
+        assert!(is_gift_wrap_kind(&Kind::Custom(GIFT_WRAP_KIND)));
+        assert!(is_gift_wrap_kind(&Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)));
+        assert!(!is_gift_wrap_kind(&Kind::Custom(CTXVM_MESSAGES_KIND)));
     }
 }
