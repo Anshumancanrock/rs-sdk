@@ -35,6 +35,14 @@ pub fn get_tag_value(tags: &Tags, name: &str) -> Option<String> {
     })
 }
 
+/// Check whether a tag with the given name exists (even with no value payload).
+pub fn has_tag(tags: &Tags, name: &str) -> bool {
+    tags.iter().any(|tag| {
+        let vec = tag.clone().to_vec();
+        vec.first().map(|s| s.as_str()) == Some(name)
+    })
+}
+
 /// Extract a tag value from a slice of tags.
 pub fn get_tag_value_from_slice(tags: &[Tag], name: &str) -> Option<String> {
     tags.iter().find_map(|tag| {
@@ -70,5 +78,27 @@ mod tests {
     #[test]
     fn test_invalid_json() {
         assert!(nostr_event_to_mcp_message("not json").is_none());
+    }
+
+    #[test]
+    fn test_has_tag_detects_presence_only_custom_tags() {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::TextNote, "hello")
+            .tags(vec![
+                Tag::custom(
+                    TagKind::Custom("support_encryption".into()),
+                    Vec::<String>::new(),
+                ),
+                Tag::custom(
+                    TagKind::Custom("name".into()),
+                    vec!["test-server".to_string()],
+                ),
+            ])
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        assert!(has_tag(&event.tags, "support_encryption"));
+        assert!(has_tag(&event.tags, "name"));
+        assert!(!has_tag(&event.tags, "support_encryption_ephemeral"));
     }
 }

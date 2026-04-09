@@ -66,12 +66,25 @@ pub async fn gift_wrap_single_layer<T>(
 where
     T: NostrSigner,
 {
+    gift_wrap_single_layer_with_kind(_signer, recipient, plaintext, GIFT_WRAP_KIND).await
+}
+
+/// Create a single-layer NIP-44 gift wrap with a configurable outer event kind.
+pub async fn gift_wrap_single_layer_with_kind<T>(
+    _signer: &T,
+    recipient: &PublicKey,
+    plaintext: &str,
+    outer_kind: u16,
+) -> Result<Event>
+where
+    T: NostrSigner,
+{
     let ephemeral = Keys::generate();
 
     let encrypted = encrypt_nip44(&ephemeral, recipient, plaintext).await?;
 
     let builder =
-        EventBuilder::new(Kind::Custom(GIFT_WRAP_KIND), encrypted).tag(Tag::public_key(*recipient));
+        EventBuilder::new(Kind::Custom(outer_kind), encrypted).tag(Tag::public_key(*recipient));
 
     builder
         .sign_with_keys(&ephemeral)
@@ -111,7 +124,7 @@ pub async fn gift_wrap(
 
 #[cfg(test)]
 mod tests {
-    use crate::core::constants::GIFT_WRAP_KIND;
+    use crate::core::constants::{EPHEMERAL_GIFT_WRAP_KIND, GIFT_WRAP_KIND};
 
     use super::*;
 
@@ -141,10 +154,7 @@ mod tests {
     ///   2. NIP-44 encrypt the plaintext using ephemeral_secret + recipient_pubkey
     ///   3. Build kind 1059 event with encrypted content, `p` tag = recipient
     ///   4. Sign with ephemeral key
-    async fn create_simple_gift_wrap(
-        plaintext: &str,
-        recipient: &PublicKey,
-    ) -> (Event, Keys) {
+    async fn create_simple_gift_wrap(plaintext: &str, recipient: &PublicKey) -> (Event, Keys) {
         let ephemeral = Keys::generate();
 
         // Single-layer NIP-44 encrypt
@@ -229,6 +239,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_gift_wrap_roundtrip_single_layer_ephemeral_kind() {
+        let sender_keys = Keys::generate();
+        let recipient_keys = Keys::generate();
+
+        let inner_event = EventBuilder::new(Kind::Custom(25910), "hello")
+            .tag(Tag::public_key(recipient_keys.public_key()))
+            .sign_with_keys(&sender_keys)
+            .unwrap();
+        let inner_json = serde_json::to_string(&inner_event).unwrap();
+
+        let gift_wrap_event = gift_wrap_single_layer_with_kind(
+            &sender_keys,
+            &recipient_keys.public_key(),
+            &inner_json,
+            EPHEMERAL_GIFT_WRAP_KIND,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(gift_wrap_event.kind, Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND));
+
+        let decrypted = decrypt_gift_wrap_single_layer(&recipient_keys, &gift_wrap_event)
+            .await
+            .unwrap();
+        let parsed: Event = serde_json::from_str(&decrypted).unwrap();
+        assert_eq!(parsed.content, "hello");
+    }
+
+    #[tokio::test]
     async fn test_gift_wrap_has_correct_tags() {
         let sender_keys = Keys::generate();
         let recipient_keys = Keys::generate();
@@ -282,15 +321,12 @@ mod tests {
             .unwrap();
 
         // Step 2: tamper the pubkey (keep original, now-invalid, signature)
-        let mut forged_json: serde_json::Value =
-            serde_json::to_value(&inner_event).unwrap();
-        forged_json["pubkey"] =
-            serde_json::Value::String(impersonated.public_key().to_hex());
+        let mut forged_json: serde_json::Value = serde_json::to_value(&inner_event).unwrap();
+        forged_json["pubkey"] = serde_json::Value::String(impersonated.public_key().to_hex());
         let forged_str = serde_json::to_string(&forged_json).unwrap();
 
         // Step 3: gift-wrap the forged payload
-        let (gift_wrap, _) =
-            create_simple_gift_wrap(&forged_str, &recipient.public_key()).await;
+        let (gift_wrap, _) = create_simple_gift_wrap(&forged_str, &recipient.public_key()).await;
 
         // Decrypt + parse both succeed — the forgery is syntactically valid
         let decrypted = decrypt_gift_wrap_single_layer(&recipient, &gift_wrap)

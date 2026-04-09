@@ -22,6 +22,23 @@ pub enum EncryptionMode {
     Disabled,
 }
 
+/// Outbound gift-wrap policy for encrypted MCP messages.
+///
+/// Controls which outer envelope kind is used when encryption is enabled:
+/// - kind 1059 (persistent gift wrap)
+/// - kind 21059 (ephemeral gift wrap, CEP-19)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GiftWrapMode {
+    /// Use ephemeral gift wraps only when peer capability indicates support.
+    #[default]
+    Optional,
+    /// Always use ephemeral gift wraps (kind 21059) when encrypting.
+    Always,
+    /// Never use ephemeral gift wraps; always use kind 1059 when encrypting.
+    Never,
+}
+
 // ── Server info ─────────────────────────────────────────────────────
 
 /// Server information for announcements (kind 11316).
@@ -56,6 +73,8 @@ pub struct ClientSession {
     pub is_initialized: bool,
     /// Whether the client's messages were encrypted.
     pub is_encrypted: bool,
+    /// Whether the peer has demonstrated ephemeral gift-wrap support.
+    pub supports_ephemeral_gift_wrap: Option<bool>,
     /// Last activity timestamp.
     pub last_activity: Instant,
     /// Pending requests: event_id → original request ID.
@@ -70,6 +89,7 @@ impl ClientSession {
         Self {
             is_initialized: false,
             is_encrypted,
+            supports_ephemeral_gift_wrap: None,
             last_activity: Instant::now(),
             pending_requests: HashMap::new(),
             event_to_progress_token: HashMap::new(),
@@ -254,6 +274,33 @@ mod tests {
         let s = serde_json::to_string(&mode).unwrap();
         assert_eq!(s, "\"disabled\"");
         let parsed: EncryptionMode = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed, mode);
+    }
+
+    #[test]
+    fn test_gift_wrap_mode_serde_roundtrip_optional() {
+        let mode = GiftWrapMode::Optional;
+        let s = serde_json::to_string(&mode).unwrap();
+        assert_eq!(s, "\"optional\"");
+        let parsed: GiftWrapMode = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed, mode);
+    }
+
+    #[test]
+    fn test_gift_wrap_mode_serde_roundtrip_always() {
+        let mode = GiftWrapMode::Always;
+        let s = serde_json::to_string(&mode).unwrap();
+        assert_eq!(s, "\"always\"");
+        let parsed: GiftWrapMode = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed, mode);
+    }
+
+    #[test]
+    fn test_gift_wrap_mode_serde_roundtrip_never() {
+        let mode = GiftWrapMode::Never;
+        let s = serde_json::to_string(&mode).unwrap();
+        assert_eq!(s, "\"never\"");
+        let parsed: GiftWrapMode = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed, mode);
     }
 

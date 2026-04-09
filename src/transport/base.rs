@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::core::constants::*;
 use crate::core::error::{Error, Result};
 use crate::core::serializers;
-use crate::core::types::{EncryptionMode, JsonRpcMessage};
+use crate::core::types::{EncryptionMode, GiftWrapMode, JsonRpcMessage};
 use crate::core::validation;
 use crate::encryption;
 use crate::relay::RelayPool;
@@ -21,6 +21,8 @@ pub struct BaseTransport {
     pub relay_pool: Arc<RelayPool>,
     /// The encryption policy for outgoing messages.
     pub encryption_mode: EncryptionMode,
+    /// The outbound gift-wrap envelope policy for encrypted messages.
+    pub gift_wrap_mode: GiftWrapMode,
     /// Whether the transport is currently connected to relays.
     pub is_connected: bool,
 }
@@ -112,6 +114,7 @@ impl BaseTransport {
         kind: u16,
         tags: Vec<Tag>,
         is_encrypted: Option<bool>,
+        peer_supports_ephemeral: Option<bool>,
     ) -> Result<EventId> {
         let should_encrypt = self.should_encrypt(kind, is_encrypted);
 
@@ -129,12 +132,19 @@ impl BaseTransport {
                 .signer()
                 .await
                 .map_err(|e| Error::Encryption(e.to_string()))?;
-            let gift_wrap_event =
-                encryption::gift_wrap_single_layer(&signer, recipient, &event_json).await?;
+            let gift_wrap_kind = self.select_gift_wrap_kind(peer_supports_ephemeral);
+            let gift_wrap_event = encryption::gift_wrap_single_layer_with_kind(
+                &signer,
+                recipient,
+                &event_json,
+                gift_wrap_kind,
+            )
+            .await?;
             self.relay_pool.publish_event(&gift_wrap_event).await?;
             tracing::debug!(
                 signed_event_id = %signed_event_id,
                 envelope_id = %gift_wrap_event.id,
+                gift_wrap_kind = gift_wrap_kind,
                 "Sent encrypted MCP message"
             );
         } else {
@@ -156,6 +166,21 @@ impl BaseTransport {
             EncryptionMode::Disabled => false,
             EncryptionMode::Required => true,
             EncryptionMode::Optional => is_encrypted.unwrap_or(true),
+        }
+    }
+
+    /// Select the outer envelope kind for encrypted messages.
+    pub fn select_gift_wrap_kind(&self, peer_supports_ephemeral: Option<bool>) -> u16 {
+        match self.gift_wrap_mode {
+            GiftWrapMode::Always => EPHEMERAL_GIFT_WRAP_KIND,
+            GiftWrapMode::Never => GIFT_WRAP_KIND,
+            GiftWrapMode::Optional => {
+                if peer_supports_ephemeral.unwrap_or(false) {
+                    EPHEMERAL_GIFT_WRAP_KIND
+                } else {
+                    GIFT_WRAP_KIND
+                }
+            }
         }
     }
 
@@ -184,6 +209,20 @@ mod tests {
             EncryptionMode::Disabled => false,
             EncryptionMode::Required => true,
             EncryptionMode::Optional => is_encrypted.unwrap_or(true),
+        }
+    }
+
+    fn select_gift_wrap_kind(mode: GiftWrapMode, peer_supports_ephemeral: Option<bool>) -> u16 {
+        match mode {
+            GiftWrapMode::Always => EPHEMERAL_GIFT_WRAP_KIND,
+            GiftWrapMode::Never => GIFT_WRAP_KIND,
+            GiftWrapMode::Optional => {
+                if peer_supports_ephemeral.unwrap_or(false) {
+                    EPHEMERAL_GIFT_WRAP_KIND
+                } else {
+                    GIFT_WRAP_KIND
+                }
+            }
         }
     }
 
@@ -252,6 +291,42 @@ mod tests {
             assert!(!should_encrypt(EncryptionMode::Optional, kind, Some(true)));
             assert!(!should_encrypt(EncryptionMode::Disabled, kind, Some(true)));
         }
+    }
+
+    #[test]
+    fn test_select_gift_wrap_kind_always() {
+        assert_eq!(
+            select_gift_wrap_kind(GiftWrapMode::Always, Some(false)),
+            EPHEMERAL_GIFT_WRAP_KIND
+        );
+        assert_eq!(
+            select_gift_wrap_kind(GiftWrapMode::Always, None),
+            EPHEMERAL_GIFT_WRAP_KIND
+        );
+    }
+
+    #[test]
+    fn test_select_gift_wrap_kind_never() {
+        assert_eq!(
+            select_gift_wrap_kind(GiftWrapMode::Never, Some(true)),
+            GIFT_WRAP_KIND
+        );
+    }
+
+    #[test]
+    fn test_select_gift_wrap_kind_optional() {
+        assert_eq!(
+            select_gift_wrap_kind(GiftWrapMode::Optional, Some(true)),
+            EPHEMERAL_GIFT_WRAP_KIND
+        );
+        assert_eq!(
+            select_gift_wrap_kind(GiftWrapMode::Optional, Some(false)),
+            GIFT_WRAP_KIND
+        );
+        assert_eq!(
+            select_gift_wrap_kind(GiftWrapMode::Optional, None),
+            GIFT_WRAP_KIND
+        );
     }
 
     #[test]

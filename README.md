@@ -39,6 +39,7 @@ ContextVM maps MCP's JSON-RPC 2.0 messages onto Nostr events:
 |---------|------------------------|-------------|--------------------------------------|
 | `25910` | ContextVM Messages     | Ephemeral   | MCP request/response/notification    |
 | `1059`  | Gift Wrap (NIP-59)     | Regular     | Encrypted MCP messages               |
+| `21059` | Ephemeral Gift Wrap    | Ephemeral   | CEP-19 encrypted MCP messages        |
 | `11316` | Server Announcement    | Addressable | Server identity & metadata           |
 | `11317` | Tools List             | Addressable | Published tool capabilities          |
 | `11318` | Resources List         | Addressable | Published resource capabilities      |

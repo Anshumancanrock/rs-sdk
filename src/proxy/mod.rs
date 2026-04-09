@@ -110,6 +110,8 @@ mod tests {
             relay_urls: vec!["wss://relay.example.com".to_string()],
             server_pubkey: server_pubkey.clone(),
             encryption_mode: EncryptionMode::Required,
+            gift_wrap_mode: GiftWrapMode::Optional,
+            server_supports_ephemeral: None,
             is_stateless: true,
             timeout: Duration::from_secs(60),
         };

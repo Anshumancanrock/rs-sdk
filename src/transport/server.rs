@@ -25,6 +25,8 @@ pub struct NostrServerTransportConfig {
     pub relay_urls: Vec<String>,
     /// Encryption mode.
     pub encryption_mode: EncryptionMode,
+    /// Outbound gift-wrap envelope policy when encryption is used.
+    pub gift_wrap_mode: GiftWrapMode,
     /// Server information for announcements.
     pub server_info: Option<ServerInfo>,
     /// Whether this server publishes public announcements (CEP-6).
@@ -44,6 +46,7 @@ impl Default for NostrServerTransportConfig {
         Self {
             relay_urls: vec!["wss://relay.damus.io".to_string()],
             encryption_mode: EncryptionMode::Optional,
+            gift_wrap_mode: GiftWrapMode::Optional,
             server_info: None,
             is_announced_server: false,
             allowed_public_keys: Vec::new(),
@@ -81,6 +84,20 @@ pub struct IncomingRequest {
 }
 
 impl NostrServerTransport {
+    fn supports_ephemeral_gift_wrap_config(
+        encryption_mode: EncryptionMode,
+        gift_wrap_mode: GiftWrapMode,
+    ) -> bool {
+        encryption_mode != EncryptionMode::Disabled && gift_wrap_mode != GiftWrapMode::Never
+    }
+
+    fn supports_ephemeral_gift_wrap(&self) -> bool {
+        Self::supports_ephemeral_gift_wrap_config(
+            self.config.encryption_mode,
+            self.config.gift_wrap_mode,
+        )
+    }
+
     /// Create a new server transport.
     pub async fn new<T>(signer: T, config: NostrServerTransportConfig) -> Result<Self>
     where
@@ -93,6 +110,7 @@ impl NostrServerTransport {
             base: BaseTransport {
                 relay_pool,
                 encryption_mode: config.encryption_mode,
+                gift_wrap_mode: config.gift_wrap_mode,
                 is_connected: false,
             },
             config,
@@ -191,6 +209,7 @@ impl NostrServerTransport {
         }
 
         let is_encrypted = session.is_encrypted;
+        let peer_supports_ephemeral = session.supports_ephemeral_gift_wrap;
         drop(sessions);
 
         let client_pubkey =
@@ -208,6 +227,7 @@ impl NostrServerTransport {
                 CTXVM_MESSAGES_KIND,
                 tags,
                 Some(is_encrypted),
+                peer_supports_ephemeral,
             )
             .await?;
 
@@ -239,6 +259,7 @@ impl NostrServerTransport {
             .get(client_pubkey_hex)
             .ok_or_else(|| Error::Other(format!("No session for {client_pubkey_hex}")))?;
         let is_encrypted = session.is_encrypted;
+        let peer_supports_ephemeral = session.supports_ephemeral_gift_wrap;
         drop(sessions);
 
         let client_pubkey =
@@ -257,6 +278,7 @@ impl NostrServerTransport {
                 CTXVM_MESSAGES_KIND,
                 tags,
                 Some(is_encrypted),
+                peer_supports_ephemeral,
             )
             .await?;
 
@@ -328,6 +350,8 @@ impl NostrServerTransport {
                 TagKind::Custom(tags::SUPPORT_ENCRYPTION.into()),
                 Vec::<String>::new(),
             ));
+        }
+        if self.supports_ephemeral_gift_wrap() {
             tags.push(Tag::custom(
                 TagKind::Custom(tags::SUPPORT_ENCRYPTION_EPHEMERAL.into()),
                 Vec::<String>::new(),
@@ -484,68 +508,72 @@ impl NostrServerTransport {
 
         while let Ok(notification) = notifications.recv().await {
             if let RelayPoolNotification::Event { event, .. } = notification {
-                let (content, sender_pubkey, event_id, is_encrypted) = if event.kind
-                    == Kind::Custom(GIFT_WRAP_KIND)
-                    || event.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
-                {
-                    if encryption_mode == EncryptionMode::Disabled {
-                        tracing::warn!("Received encrypted message but encryption is disabled");
-                        continue;
-                    }
-                    // Single-layer NIP-44 decrypt (matches JS/TS SDK)
-                    let signer = match client.signer().await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::error!("Failed to get signer: {e}");
+                let (content, sender_pubkey, event_id, is_encrypted, peer_supports_ephemeral) =
+                    if event.kind == Kind::Custom(GIFT_WRAP_KIND)
+                        || event.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND)
+                    {
+                        let peer_supports_ephemeral =
+                            event.kind == Kind::Custom(EPHEMERAL_GIFT_WRAP_KIND);
+                        if encryption_mode == EncryptionMode::Disabled {
+                            tracing::warn!("Received encrypted message but encryption is disabled");
                             continue;
                         }
-                    };
-                    match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
-                        Ok(decrypted_json) => {
-                            // The decrypted content is JSON of the inner signed event.
-                            // Use the INNER event's ID for correlation — the client
-                            // registers the inner event ID in its correlation store.
-                            match serde_json::from_str::<Event>(&decrypted_json) {
-                                Ok(inner) => {
-                                    if let Err(e) = inner.verify() {
-                                        tracing::warn!(
-                                            "Inner event signature verification failed: {e}"
-                                        );
+                        // Single-layer NIP-44 decrypt (matches JS/TS SDK)
+                        let signer = match client.signer().await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!("Failed to get signer: {e}");
+                                continue;
+                            }
+                        };
+                        match encryption::decrypt_gift_wrap_single_layer(&signer, &event).await {
+                            Ok(decrypted_json) => {
+                                // The decrypted content is JSON of the inner signed event.
+                                // Use the INNER event's ID for correlation — the client
+                                // registers the inner event ID in its correlation store.
+                                match serde_json::from_str::<Event>(&decrypted_json) {
+                                    Ok(inner) => {
+                                        if let Err(e) = inner.verify() {
+                                            tracing::warn!(
+                                                "Inner event signature verification failed: {e}"
+                                            );
+                                            continue;
+                                        }
+                                        (
+                                            inner.content,
+                                            inner.pubkey.to_hex(),
+                                            inner.id.to_hex(),
+                                            true,
+                                            Some(peer_supports_ephemeral),
+                                        )
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to parse inner event: {e}");
                                         continue;
                                     }
-                                    (
-                                        inner.content,
-                                        inner.pubkey.to_hex(),
-                                        inner.id.to_hex(),
-                                        true,
-                                    )
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to parse inner event: {e}");
-                                    continue;
                                 }
                             }
+                            Err(e) => {
+                                tracing::error!("Failed to decrypt: {e}");
+                                continue;
+                            }
                         }
-                        Err(e) => {
-                            tracing::error!("Failed to decrypt: {e}");
+                    } else {
+                        if encryption_mode == EncryptionMode::Required {
+                            tracing::warn!(
+                                pubkey = %event.pubkey,
+                                "Received unencrypted message but encryption is required"
+                            );
                             continue;
                         }
-                    }
-                } else {
-                    if encryption_mode == EncryptionMode::Required {
-                        tracing::warn!(
-                            pubkey = %event.pubkey,
-                            "Received unencrypted message but encryption is required"
-                        );
-                        continue;
-                    }
-                    (
-                        event.content.clone(),
-                        event.pubkey.to_hex(),
-                        event.id.to_hex(),
-                        false,
-                    )
-                };
+                        (
+                            event.content.clone(),
+                            event.pubkey.to_hex(),
+                            event.id.to_hex(),
+                            false,
+                            None,
+                        )
+                    };
 
                 // Parse MCP message
                 let mcp_msg = match validation::validate_and_parse(&content) {
@@ -588,6 +616,9 @@ impl NostrServerTransport {
                     .or_insert_with(|| ClientSession::new(is_encrypted));
                 session.update_activity();
                 session.is_encrypted = is_encrypted;
+                if let Some(peer_supports_ephemeral) = peer_supports_ephemeral {
+                    session.supports_ephemeral_gift_wrap = Some(peer_supports_ephemeral);
+                }
 
                 // Track request for correlation
                 if let JsonRpcMessage::Request(ref req) = mcp_msg {
@@ -679,6 +710,7 @@ mod tests {
         let session = ClientSession::new(true);
         assert!(!session.is_initialized);
         assert!(session.is_encrypted);
+        assert_eq!(session.supports_ephemeral_gift_wrap, None);
         assert!(session.pending_requests.is_empty());
         assert!(session.event_to_progress_token.is_empty());
     }
@@ -876,6 +908,7 @@ mod tests {
     fn test_encryption_mode_default() {
         let config = NostrServerTransportConfig::default();
         assert_eq!(config.encryption_mode, EncryptionMode::Optional);
+        assert_eq!(config.gift_wrap_mode, GiftWrapMode::Optional);
     }
 
     // ── Config defaults ─────────────────────────────────────────
@@ -887,8 +920,29 @@ mod tests {
         assert!(!config.is_announced_server);
         assert!(config.allowed_public_keys.is_empty());
         assert!(config.excluded_capabilities.is_empty());
+        assert_eq!(config.gift_wrap_mode, GiftWrapMode::Optional);
         assert_eq!(config.cleanup_interval, Duration::from_secs(60));
         assert_eq!(config.session_timeout, Duration::from_secs(300));
         assert!(config.server_info.is_none());
+    }
+
+    #[test]
+    fn test_supports_ephemeral_gift_wrap_config_matrix() {
+        assert!(!NostrServerTransport::supports_ephemeral_gift_wrap_config(
+            EncryptionMode::Disabled,
+            GiftWrapMode::Always
+        ));
+        assert!(!NostrServerTransport::supports_ephemeral_gift_wrap_config(
+            EncryptionMode::Optional,
+            GiftWrapMode::Never
+        ));
+        assert!(NostrServerTransport::supports_ephemeral_gift_wrap_config(
+            EncryptionMode::Required,
+            GiftWrapMode::Optional
+        ));
+        assert!(NostrServerTransport::supports_ephemeral_gift_wrap_config(
+            EncryptionMode::Optional,
+            GiftWrapMode::Always
+        ));
     }
 }

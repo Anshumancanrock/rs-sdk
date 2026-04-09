@@ -26,6 +26,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         relay_urls: vec![relay_url.to_string()],
         server_pubkey: server_keys.public_key().to_hex(),
         encryption_mode: EncryptionMode::Required, // STRICT MODE
+        gift_wrap_mode: GiftWrapMode::Optional,
+        server_supports_ephemeral: None,
         is_stateless: false,
         timeout: Duration::from_secs(10),
     };
